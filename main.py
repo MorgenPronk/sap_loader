@@ -93,109 +93,71 @@ def get_hierarchy_desc(normalized_id):
     return hierarchy_desc
 
 # %%
-def get_hierarchy_chain(start_id, hierarchy_df, equip_df) -> List[Dict[str, Any]]:
+
+def get_hierarchy_chain(start_id, hierarchy_df, equip_row: pd.Series) -> List[Dict[str, Any]]:
     normalized_id = start_id.replace('-', '').strip()
-    # print(f"Normalized id: {normalized_id}")
-    columns = ['level_4', 'level_4_1', 'level_5', 'level_5_1', 'level_6', 'level_6_1', 'level_7', 'level_8']
-    normalized_columns = ['level_4', 'level_4_1', 'level_5', 'level_5_1', 'level_6', 'level_6_1_normalized', 'level_7_normalized', 'level_8_normalized']
     equipment_levels = ['level_6_1', 'level_7', 'level_8']
-    levels_to_concat = ['level_4', 'level_4_1', 'level_5', 'level_5_1', 'level_6']
+    hierarchy_columns = ['level_4', 'level_4_1', 'level_5', 'level_5_1', 'level_6', 'level_6_1']
+    normalized_columns = ['level_6_1_normalized', 'level_7_normalized', 'level_8_normalized']
 
+    # Find the initial match row
+    match_row = None
+    for norm_col in normalized_columns:
+        match = hierarchy_df[hierarchy_df[norm_col] == normalized_id]
+        if not match.empty:
+            match_row = match.iloc[0].copy()
+            break
+
+    if match_row is None:
+        logging.warning(f"No match found in hierarchy for ID '{normalized_id}'")
+        return []
+
+    # Build the chain from bottom to top
     chain = []
-    match_copy = None
+    for i in reversed(range(len(hierarchy_columns))):
+        col = hierarchy_columns[i]
+        raw_value = match_row[col]
+        if pd.isna(raw_value):
+            continue
 
-    while normalized_id:
-        # Find the matching row in the hierarchy_df
-        match_row = None
-        match_col = None
+        # Concatenate all levels up to this one
+        full_tag = '-'.join(
+            str(match_row[hierarchy_columns[j]]) for j in range(i + 1)
+            if pd.notna(match_row[hierarchy_columns[j]])
+        )
 
-        for norm_col in normalized_columns:
-            print(f"Nomalized_id: {normalized_id}; norm_col: {norm_col}") # Debugging
-            match = hierarchy_df[hierarchy_df[norm_col] == normalized_id]
-            print(f"match: {match}") #Debugging
-            if not match.empty:
-                match_row = match.iloc[0].copy()
-                # print(f"~match_row when created~\n {match_row}") # Debugging 
-                match_col = norm_col.replace('_normalized', '')
-                # print(f"match_row: {match_row}; match_col: {match_col}") # Debugging 
-                break
-
-        if match_row is None:
-            logging.warning(f"No match found in hierarchy for ID '{normalized_id}'")
-            # We need to check if it is an equipment level - If it is, even if it isn't in the hierarchy, we need to grab the right information
-            if match_col not in equipment_levels:
-                break
-
-        # Now we have a match_row and match_col, we should build out what the tags are in the chain and put them in a list
-        # we take the row, and start at the beginnging of the row, and then we will build out the chain
-
-        # copy the match to get an uncatentated version - the hierarchy output is the just the category the equipment will be in. We have to make the tags for each of those which involves concatenating things
-        concat_values = match_row[levels_to_concat].copy() # This isn't concatenated yet
-        match_row_non_concat = match_row.copy()
-
-        # Here we concatenate the hierarchy levels with the prior levels to get the tag for any given level
-        for i, level in enumerate(levels_to_concat):
-            match_row[level] = '-'.join(
-                str(concat_values[l]) for l in levels_to_concat[:i+1] if pd.notna(match_row[l])
-            )
-
-
-        print(f"~match_row before extraction~\n {match_row}")
-        current_id = match_row[match_col]
-        idx = columns.index(match_col)
-        parent_id = match_row[columns[idx - 1]] if idx > 0 else None
-        parent_id_not_concat = match_row_non_concat[columns[idx-1]] if idx > 0 else None # this is to get the non concatenated version to keep the loop going
-        subclass = match_row.get('subclass', '')
-        print(f"current_id- {current_id}; idx- {idx}; parnet_id- {parent_id}; subclass- {subclass} ")
-
+        parent_tag = '-'.join(
+            str(match_row[hierarchy_columns[j]]) for j in range(i)
+            if pd.notna(match_row[hierarchy_columns[j]])
+        ) if i > 0 else None
         entry = {
-            'ID': current_id,
-            'Superior FLOC': parent_id,
+            'ID': full_tag,
+            'Superior FLOC': parent_tag
         }
 
-        # If it's an equipment level, try to get extra data
-        if match_col in equipment_levels:
-            
-            subclass = match_row.get('subclass', '')
+        # Add description or equipment metadata
+        if col in equipment_levels:
+            entry.update({
+                'Subclass': match_row.get('subclass', ''),
+                'Make': str(equip_row['Mfg_Desc']).strip(),
+                'Model': str(equip_row['Product_Model']).strip(),
+                'Description': "; ".join(
+                    str(equip_row[col]).strip()
+                    for col in ['Description', 'Description_2', 'Description_3']
+                    if pd.notna(equip_row[col])
+                )
+            })
 
-            equip_match = equip_df[
-                (equip_df['Serial_Number'].astype(str).str.strip() == current_id) |
-                (equip_df['Tag_Number'].astype(str).str.strip() == current_id)
-            ]
-            # print(f"equip_match: {equip_match}")
-
-            if not equip_match.empty:
-                equip_row = equip_match.iloc[0]
-                entry.update({
-                    'Subclass': match_row.get('subclass', ''),
-                    'Make': str(equip_row['Mfg_Desc']).strip(),
-                    'Model': str(equip_row['Product_Model']).strip(),
-                    'Description': "; ".join(
-                        str(equip_row[col]).strip()
-                        for col in ['Description', 'Description_2', 'Description_3']
-                        if pd.notna(equip_row[col])
-                    )
-                })
-                
-                # print(f"entry_update: row-{equip_row} ; {entry}")
-            else:
-                logging.warning(f"Equipment data not found for ID '{current_id}'")
         else:
-            # If it's not equipment level, we will look for a match and give it a description
-
-            hierarchy_desc = get_hierarchy_desc(normalized_id)
-            if hierarchy_desc is not None:
-                entry.update({
-                    'Description': hierarchy_desc
-                })
+            hierarchy_desc = get_hierarchy_desc(raw_value.replace('-', '').strip())
+            if hierarchy_desc:
+                entry['Description'] = hierarchy_desc
 
         chain.append(entry)
 
-        # now we change the id to the level below and do everything again
-        normalized_id = str(parent_id_not_concat).replace('-', '').strip() if parent_id else None
-
-    print(f"chain:\n {chain}")
     return chain
+
+
 
 # %%
 def write_chain_to_output(ws, chain, row_start, FLOC_sheet, current_row_offset=0):
@@ -223,7 +185,7 @@ def extract_from_sheets(equip_df, hierarchy_df, row_start, loadsheet_path, FLOC_
     current_row_offset = 0
     # print(equip_df) # debugging
     # input() # debugging
-    for row in tqdm(equip_df.itertuples(index=True), total=len(equip_df), desc= "Processing Equipment"): # Take head() out when you want to run the entire sheet
+    for row in tqdm(equip_df.itertuples(index=True), total=len(equip_df), desc= "Processing Equipment"):
         # print("in progress bar loop")
         serial = str(row.Serial_Number).strip()
         tag = str(row.Tag_Number).strip()
@@ -239,7 +201,7 @@ def extract_from_sheets(equip_df, hierarchy_df, row_start, loadsheet_path, FLOC_
             id = ''
 
         # get the hierarchy chain for the current ID
-        chain = get_hierarchy_chain(id, hierarchy_df, equip_df)
+        chain = get_hierarchy_chain(id, hierarchy_df, pd.Series(row._asdict()))
         
         current_row_offset, ws = write_chain_to_output(ws, chain, row_start, FLOC_sheet, current_row_offset)
 
@@ -289,7 +251,7 @@ def main():
     # If we want to start from a different row then we overwrite the row_start variable
     row_start = output_start_row
 
-    equip_df = equip_df.head(1).copy() # For testing purposes, we will only take the first 5 rows of the hierarchy_df. Remove this line when you want to run the entire hierarchy_df
+    # equip_df = equip_df.head(1).copy() # For testing purposes, we will only take the first 5 rows of the hierarchy_df. Remove this line when you want to run the entire hierarchy_df
 
     # run the sheet
     extract_from_sheets(equip_df.iloc[equipment_start_index:].copy(), hierarchy_df, row_start, loadsheet_path, FLOC_sheet)
