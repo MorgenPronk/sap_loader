@@ -9,6 +9,12 @@ import logging
 import json
 import shutil
 from tqdm import tqdm
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def _load_config():
+    with open(os.path.join("data", "config.json"), 'r') as f:
+        return json.load(f)
 
 # %%
 def config_logging(filepath):
@@ -27,10 +33,28 @@ def config_logging(filepath):
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
+def _is_nonempty(x) -> bool:
+    return pd.notna(x) and and str(x).strip().lower() not in {'', 'nan', 'none'}
+
+def _choose_id(row) -> str:
+    serial = row.Serial_Number if hasattr(row, 'Serial_Number') else None
+    tag = row.Tag_Number if hasattr(row, 'Tag_Number') else None
+    if _is_nonempty(serial):
+        return str(serial).strip()
+    if _is_nonempty(tag):
+        return str(tag).strip()
+    return ''
+
 # %%
 def load_files(equipment_path, hierarchy_path, loadsheet_path):
-    equip_df = pd.read_excel(equipment_path)
-    hierarchy_df = pd.read_excel(hierarchy_path)
+    equip_df = pd.read_excel(
+        equipment_path,
+        usecols=["Serial Number", "Tag Number", "Mfg Desc", "Product Model", "Description", "Description 2", "Description 3"]
+        )
+    hierarchy_df = pd.read_excel(
+        hierarchy_path,
+        usecols=["level_4", "level_4_1", "level_5", "level_5_1", "level_6", "level_6_1", "level_7", "level_8", "subclass"]
+        )
     loadsheet_dict = pd.read_excel(loadsheet_path, sheet_name= None)
     return equip_df, hierarchy_df, loadsheet_dict
 
@@ -57,21 +81,32 @@ def static_variables():
     #  Defining some of the output columns and rows for the simpleload.xlsx file
     # We will define maps here for LLM outputs to code if we need to, but will likely just train LLM to output the right code.
     
-
-    # extract needed values from JSON config file
-    # we will hardcode the config file here for now
-    json_path = "./data/config.json"
-    with open(json_path, 'r') as f:
-        config = json.load(f)
-    row_start = config.get("row_start")
-
-    # columns for "FLOC Only" sheet
+    config = _load_config()
+    row_start = config.get("row_start", 3)
     FLOC_sheet = config.get("FLOC_sheet")
-
-    # columns for FLOCEquip Sheet
     equip_sheet = config.get("equip_sheet")
-    
     return row_start, FLOC_sheet, equip_sheet
+
+def _build_hierarchy_desc_map():
+    data = _load_config()
+    target_keys = ['L4_codes', 'L4_1_codes', 'L5_codes', 'L5_1_codes']
+    m = {}
+    for key in target_keys:
+        for desc, code in data.get(key, {}).items():
+            m[str(code).replace('-', '')] = desc
+    return m
+
+def build_hierarchy_index(hierarchy_df):
+    # make sure normalized columns exist (preprocess already does this)
+    index = {}
+    cols = ['level_6_1_normalized', 'level_7_normalized', 'level_8_normalized']
+    for _, row in hierarchy_df.iterrows():
+        for c in cols:
+            key = row.get(c)
+            if pd.notna(key):
+                index[str(key)] = row
+
+    return index
 
 def get_hierarchy_desc(normalized_id):
     # print(normalized_id)
@@ -94,25 +129,16 @@ def get_hierarchy_desc(normalized_id):
 
 # %%
 
-def get_hierarchy_chain(start_id, hierarchy_df, equip_row: pd.Series) -> List[Dict[str, Any]]:
+def get_hierarchy_chain(start_id, hierarchy_index, hierarchy_desc_map, equip_row: pd.Series)) -> List[Dict[str, Any]]:
     normalized_id = start_id.replace('-', '').strip()
-    equipment_levels = ['level_6_1', 'level_7', 'level_8']
-    hierarchy_columns = ['level_4', 'level_4_1', 'level_5', 'level_5_1', 'level_6', 'level_6_1']
-    normalized_columns = ['level_6_1_normalized', 'level_7_normalized', 'level_8_normalized']
-
-    # Find the initial match row
-    match_row = None
-    for norm_col in normalized_columns:
-        match = hierarchy_df[hierarchy_df[norm_col] == normalized_id]
-        if not match.empty:
-            match_row = match.iloc[0].copy()
-            break
-
+    match_row = hierarchy_index.get(normalized_id)
     if match_row is None:
         logging.warning(f"No match found in hierarchy for ID '{normalized_id}'")
         return []
+    
+    equipment_levels = ['level_6_1', 'level_7', 'level_8']
+    hierarchy_columns = ['level_4', 'level_4_1', 'level_5', 'level_5_1', 'level_6', 'level_6_1']
 
-    # Build the chain from bottom to top
     chain = []
     for i in reversed(range(len(hierarchy_columns))):
         col = hierarchy_columns[i]
@@ -120,62 +146,50 @@ def get_hierarchy_chain(start_id, hierarchy_df, equip_row: pd.Series) -> List[Di
         if pd.isna(raw_value):
             continue
 
-        # Concatenate all levels up to this one
-        full_tag = '-'.join(
-            str(match_row[hierarchy_columns[j]]) for j in range(i + 1)
-            if pd.notna(match_row[hierarchy_columns[j]])
-        )
-
-        parent_tag = '-'.join(
-            str(match_row[hierarchy_columns[j]]) for j in range(i)
-            if pd.notna(match_row[hierarchy_columns[j]])
-        ) if i > 0 else None
-        entry = {
-            'ID': full_tag,
-            'Superior FLOC': parent_tag
-        }
-
-        # Add description or equipment metadata
+        parts = [str(match_row[c]) for c in hierarchy_columns[:i+1] if pd.notna(match_row[c])]
+        parent = [str(march_row[c]) for c in hierarchy_columns[:i] if pd.notna(match_row[c])]
+        entry = {'ID': '-'.join(parts), 'Superior FLOC': '-'.join(parents) if parent else None}
+        
         if col in equipment_levels:
             entry.update({
                 'Subclass': match_row.get('subclass', ''),
-                'Make': str(equip_row['Mfg_Desc']).strip(),
-                'Model': str(equip_row['Product_Model']).strip(),
+                'Make': str(equip_row.get('Mfg_Desc', '')).strip(),
+                'Model': str(equip_row.get('Product_Model', '')).strip(),
                 'Description': "; ".join(
-                    str(equip_row[col]).strip()
-                    for col in ['Description', 'Description_2', 'Description_3']
-                    if pd.notna(equip_row[col])
+                    str(equip_row[c]).strip()
+                    for c in ['Description', 'Description_2', 'Description_3']
+                    if pd.notna(equip_row.get(c))
                 )
             })
-
         else:
-            hierarchy_desc = get_hierarchy_desc(raw_value.replace('-', '').strip())
-            if hierarchy_desc:
-                entry['Description'] = hierarchy_desc
+            desc_key = str(raw_value).replace('-', '').strip()
+            desc = hierarchy_desc_map.get(desc_key)
+            if desc:
+                entry['Description'] = desc
 
         chain.append(entry)
 
     return chain
 
-
-
 # %%
 def write_chain_to_output(ws, chain, row_start, FLOC_sheet, current_row_offset=0):
+    col_id = FLOC_sheet["ID (Blank if Equipment)"]
+    col_parent = FLOC_sheet["Superior FLOC (Parent)"]
+    col_class = FLOC_sheet["Class (DCAM Subclass)"]
+    col_desc = FLOC_sheet["Description"]
+    col_make = FLOC_sheet["Make"]
+    col_model = FLOC_sheet["Model"]
+
     for i, entry in enumerate(chain):
-        ws.cell(row=row_start + current_row_offset + i, column=FLOC_sheet["ID (Blank if Equipment)"], value=entry['ID'])
-        ws.cell(row=row_start + current_row_offset + i, column=FLOC_sheet["Superior FLOC (Parent)"], value=entry['Superior FLOC'])
-        ws.cell(row=row_start + current_row_offset + i, column=FLOC_sheet["Class (DCAM Subclass)"], value=entry.get('Subclass', ''))
-
-        if 'Description' in entry:
-            ws.cell(row=row_start + current_row_offset + i, column=FLOC_sheet["Description"], value=entry['Description'])
-        if 'Make' in entry:
-            ws.cell(row=row_start + current_row_offset + i, column=FLOC_sheet["Make"], value=entry['Make'])
-        if 'Model' in entry:
-            ws.cell(row=row_start + current_row_offset + i, column=FLOC_sheet["Model"], value=entry['Model'])
-
-    current_row_offset += len(chain)
-
-    return current_row_offset, ws
+        r = row_start + current_row_offset + i
+        ws.cell(row=r, column=col_id, value=entry.get('ID'))
+        ws.cell(row=r, column=col_parent, vaule=entry.get('Superior FLOC'))
+        ws.cell(row=r, column=col_class, value=entry.get('Subclass', ''))
+        if 'Description' in entry: ws.cell(row=r, column=col_desc, value=entry['Description'])
+        if 'Make' in entry: ws.cell(row=r, column=col_make, value=entry['Make'])
+        if 'Model' in entry: ws.cell(row=r, column=col_model, value=entry['Model'])
+    
+    return current_row_offset + len(chain), ws
 
 # %%
 def extract_from_sheets(equip_df, hierarchy_df, row_start, loadsheet_path, FLOC_sheet):
