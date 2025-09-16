@@ -10,6 +10,7 @@ import json
 import shutil
 from tqdm import tqdm
 from functools import lru_cache
+from datetime import datetime
 
 @lru_cache(maxsize=1)
 def _load_config():
@@ -33,8 +34,41 @@ def config_logging(filepath):
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
+def _progress_path(loadsheet_path: str) -> str:
+    return loadsheet_path + ".progress.json"
+
+def load_progress(loadsheet_path: str):
+    try:
+        with open(_progress_path(loadsheet_path), "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    
+def save_progress(loadsheet_path: str, equipment_start_index: int, row_start: int, current_row_offset: int):
+    data = {
+        "equipment_start_index": equipment_start_index,
+        "row_start": row_start,
+        "current_row": row_start + current_row_offset
+    }
+    with open(_progress_path(loadsheet_path), "w") as f:
+        json.dump(data, f)
+
+def reset_output_from_template(template_path: str, output_path: str, backup=True):
+    """
+    Start fresh : optionally back up existing output file, then copy the tmplate to output path
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if os.path.isfile(output_path) and backup:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = output_path + f".bak.{ts}"
+        shutil.move(output_path, backup_path)
+        print(f"Backed up existing output to {backup_path}")
+    shutil.copy2(template_path, output_path)
+    print(f"Initialized fresh output from template -> {os.path.abspath(output_path)}")
+
+
 def _is_nonempty(x) -> bool:
-    return pd.notna(x) and and str(x).strip().lower() not in {'', 'nan', 'none'}
+    return pd.notna(x) and str(x).strip().lower() not in {'', 'nan', 'none'}
 
 def _choose_id(row) -> str:
     serial = row.Serial_Number if hasattr(row, 'Serial_Number') else None
@@ -55,8 +89,8 @@ def load_files(equipment_path, hierarchy_path, loadsheet_path):
         hierarchy_path,
         usecols=["level_4", "level_4_1", "level_5", "level_5_1", "level_6", "level_6_1", "level_7", "level_8", "subclass"]
         )
-    loadsheet_dict = pd.read_excel(loadsheet_path, sheet_name= None)
-    return equip_df, hierarchy_df, loadsheet_dict
+
+    return equip_df, hierarchy_df
 
 # %%
 def preprocess_dataframes(hierarchy_df, equip_df):
@@ -67,7 +101,7 @@ def preprocess_dataframes(hierarchy_df, equip_df):
     # Normalize Columns
     for col in ['level_6_1', 'level_7', 'level_8']:
         if col in hierarchy_df.columns:
-            hierarchy_df[f'{col}_normalized'] = hierarchy_df[col].astype(str).str.replace('-', '').str.strip()
+            hierarchy_df[f'{col}_normalized'] = (hierarchy_df[col].astype(str).str.replace('-', '', regex=False).str.strip())
         else:
             logging.warning(f"Column '{col}' not found in the Excel file.")
 
@@ -93,7 +127,7 @@ def _build_hierarchy_desc_map():
     m = {}
     for key in target_keys:
         for desc, code in data.get(key, {}).items():
-            m[str(code).replace('-', '')] = desc
+            m[str(code).replace('-', '').strip()] = desc
     return m
 
 def build_hierarchy_index(hierarchy_df):
@@ -108,35 +142,18 @@ def build_hierarchy_index(hierarchy_df):
 
     return index
 
-def get_hierarchy_desc(normalized_id):
-    # print(normalized_id)
-    hierarchy_desc = None
-    path = os.path.join("data", "config.json")
-    with open(path, 'r') as f:
-        data = json.load(f) # this is the map for the descriptions we are just using the names in the config file for the target keys
-    target_keys = ['L4_codes', 'L4_1_codes', 'L5_codes', 'L5_1_codes']
-    
-    for target_key in target_keys:
-        subdict = data[target_key]
-        # print(f"{target_key}") # debugging
-        for k,v in subdict.items():
-            # print(f" {v}") debugging
-            if str(v).replace('-', '') == normalized_id:
-                hierarchy_desc = k
-                break
-    # print(f"  {hierarchy_desc}") # debugging
-    return hierarchy_desc
-
 # %%
-
-def get_hierarchy_chain(start_id, hierarchy_index, hierarchy_desc_map, equip_row: pd.Series)) -> List[Dict[str, Any]]:
+def get_hierarchy_chain(start_id, hierarchy_index, hierarchy_desc_map, equip_row: pd.Series) -> List[Dict[str, Any]]:
+    if not start_id:
+        return []
+    
     normalized_id = start_id.replace('-', '').strip()
     match_row = hierarchy_index.get(normalized_id)
     if match_row is None:
         logging.warning(f"No match found in hierarchy for ID '{normalized_id}'")
         return []
     
-    equipment_levels = ['level_6_1', 'level_7', 'level_8']
+    equipment_levels = {'level_6_1', 'level_7', 'level_8'}
     hierarchy_columns = ['level_4', 'level_4_1', 'level_5', 'level_5_1', 'level_6', 'level_6_1']
 
     chain = []
@@ -147,8 +164,8 @@ def get_hierarchy_chain(start_id, hierarchy_index, hierarchy_desc_map, equip_row
             continue
 
         parts = [str(match_row[c]) for c in hierarchy_columns[:i+1] if pd.notna(match_row[c])]
-        parent = [str(march_row[c]) for c in hierarchy_columns[:i] if pd.notna(match_row[c])]
-        entry = {'ID': '-'.join(parts), 'Superior FLOC': '-'.join(parents) if parent else None}
+        parent = [str(match_row[c]) for c in hierarchy_columns[:i] if pd.notna(match_row[c])]
+        entry = {'ID': '-'.join(parts), 'Superior FLOC': '-'.join(parent) if parent else None}
         
         if col in equipment_levels:
             entry.update({
@@ -183,7 +200,7 @@ def write_chain_to_output(ws, chain, row_start, FLOC_sheet, current_row_offset=0
     for i, entry in enumerate(chain):
         r = row_start + current_row_offset + i
         ws.cell(row=r, column=col_id, value=entry.get('ID'))
-        ws.cell(row=r, column=col_parent, vaule=entry.get('Superior FLOC'))
+        ws.cell(row=r, column=col_parent, value=entry.get('Superior FLOC'))
         ws.cell(row=r, column=col_class, value=entry.get('Subclass', ''))
         if 'Description' in entry: ws.cell(row=r, column=col_desc, value=entry['Description'])
         if 'Make' in entry: ws.cell(row=r, column=col_make, value=entry['Make'])
@@ -192,35 +209,40 @@ def write_chain_to_output(ws, chain, row_start, FLOC_sheet, current_row_offset=0
     return current_row_offset + len(chain), ws
 
 # %%
-def extract_from_sheets(equip_df, hierarchy_df, row_start, loadsheet_path, FLOC_sheet):
+def extract_from_sheets(equip_df, hierarchy_df, row_start, loadsheet_path, FLOC_sheet, equipment_start_index=0, save_every=50):
 
     wb = load_workbook(loadsheet_path)
     ws = wb[FLOC_sheet["sheet_name"]] # This will need to be put in the for loop, when we need to move between multiple sheets - like if we need to fill out the FLOCEquip sheet 
+    
+    # Build once (fast lookups)
+    hierarchy_index = build_hierarchy_index(hierarchy_df)
+    hierarchy_desc_map = _build_hierarchy_desc_map()
+    
+    
     current_row_offset = 0
     # print(equip_df) # debugging
     # input() # debugging
-    for row in tqdm(equip_df.itertuples(index=True), total=len(equip_df), desc= "Processing Equipment"):
-        # print("in progress bar loop")
-        serial = str(row.Serial_Number).strip()
-        tag = str(row.Tag_Number).strip()
+    try:
+        for i, row in enumerate(tqdm(equip_df.itertuples(index=True), total=len(equip_df), desc='Processing Equipment'), start=1):
+            id_val = _choose_id(row)
+            chain = get_hierarchy_chain(id_val, hierarchy_index, hierarchy_desc_map, pd.Series(row._asdict()))
+            current_row_offset, ws = write_chain_to_output(ws, chain, row_start, FLOC_sheet, current_row_offset)
+            
+            #periodic checkpoints
+            if i % save_every == 0:
+                wb.save(loadsheet_path)
+                save_progress(loadsheet_path, equipment_start_index + i, row_start, current_row_offset)
 
-        # Get the serial Number
-        if serial and tag:
-            id = serial
-        elif serial:
-            id = serial
-        elif tag:
-            id = tag
-        else:
-            id = ''
-
-        # get the hierarchy chain for the current ID
-        chain = get_hierarchy_chain(id, hierarchy_df, pd.Series(row._asdict()))
-        
-        current_row_offset, ws = write_chain_to_output(ws, chain, row_start, FLOC_sheet, current_row_offset)
-
-        # print(f"writing to {loadsheet_path}. Chain: {chain}") # Debugging
         wb.save(loadsheet_path)
+        save_progress(loadsheet_path, equipment_start_index + len(equip_df), row_start, current_row_offset)
+
+    finally:
+        # last-ditch save even if interrupted
+        try:
+            wb.save(loadsheet_path)
+        except Exception as e:
+            logging.warning(f"Final save failed: {e}")
+        wb.close()
 
 def excel_row_to_df_index_equip(excel_row):
     # Calibration to help start from the endpoint. The input is the excel row number where the next equipment is that should go into the output should be.
@@ -232,27 +254,30 @@ def main():
     log_output_path = 'equipment_match.log'
     equipment_path = 'data/Current JDE Equipment Table_NoFilter.xlsx' #'./data/Current JDE Equipment Table 6-2-25.xlsx'
     hierarchy_path = './data/hierarchy_output.xlsx'
-    loadsheet_path = './data/simpleload.xlsx'
+    template_path = './data/simpleload.xlsx'
+    loadsheet_path = './data/simpleload_output.xlsx'
 
-    # Copy and rename a new loadsheet - This keeps a blank copy of the loadsheet for future use that doesn't get touched
+    if not os.path.isfile(template_path):
+        raise FileNotFoundError(f"Template file not found: {os.path.abspath(template_path)}")
     
-    new_loadsheet_path = loadsheet_path.replace('.xlsx', '_output.xlsx')
-    if os.path.exists(new_loadsheet_path):
-        print("Output file exists. Will resume from last written row")
-        equipment_start_index = excel_row_to_df_index_equip(10540)
-        output_start_row = 59936 # excel row
-    else:
-        equipment_start_index = 0
-        output_start_row = 3
-        shutil.copy2(loadsheet_path, new_loadsheet_path)
-
-    loadsheet_path = new_loadsheet_path
-
-    # Configure the logging
+    # Logging
     config_logging(log_output_path)
 
+    progress = load_progress(loadsheet_path)
+    if progress:
+        print(f"Resuming from progress: {progress}")
+        equipment_start_index = progress.get("equipment_start_index", 0)
+        pending_current_row = progress.get("current_row", None)
+        starting_fresh = False
+    else:
+        print("No progress file found - starting from scratch")
+        reset_output_from_template(template_path, loadsheet_path, backup=True)
+        equipment_start_index = 0
+        pending_current_row = None
+        starting_fresh = True
+
     # Load files into Dataframes and dictionaries for use using pandas
-    equip_df, hierarchy_df, loadsheet_dict = load_files(equipment_path, hierarchy_path, loadsheet_path)
+    equip_df, hierarchy_df = load_files(equipment_path, hierarchy_path, loadsheet_path)
 
     # Preprocess dataframes - create normailized equipment columns with normalized tags for the hierarchy df and Replace any spaces with "_" in the column headers for the equipment df
     preprocess_dataframes(hierarchy_df, equip_df)
@@ -262,13 +287,18 @@ def main():
     # FLOC_sheet is one of the sheets 'FLOC Only' sheet from the loadsheet and comes from loadsheet path. This is our output.
     row_start, FLOC_sheet, equip_sheet = static_variables()
 
-    # If we want to start from a different row then we overwrite the row_start variable
-    row_start = output_start_row
-
-    # equip_df = equip_df.head(1).copy() # For testing purposes, we will only take the first 5 rows of the hierarchy_df. Remove this line when you want to run the entire hierarchy_df
+    output_start_row = pending_current_row if pending_current_row is not None else row_start
 
     # run the sheet
-    extract_from_sheets(equip_df.iloc[equipment_start_index:].copy(), hierarchy_df, row_start, loadsheet_path, FLOC_sheet)
+    extract_from_sheets(
+        equip_df.iloc[equipment_start_index:].copy(),
+        hierarchy_df,
+        output_start_row,
+        loadsheet_path,
+        FLOC_sheet,
+        equipment_start_index = equipment_start_index,
+        save_every=50
+    )
     
 if __name__ == "__main__":
     print("Chromes burning...")
